@@ -2,9 +2,9 @@
 // @name         YouTube Transcript Copier (Optimized SPA Version)
 // @match        https://www.youtube.com/*
 // @grant        none
-// @version      1.2
+// @version      1.3
 // @author       Amir Tehrani
-// @description  Adds a styled button to copy the YouTube video transcript, with a timestamp toggle. Works on playlist pages and now, also soft-navigation.
+// @description  Adds a styled button to copy the YouTube video transcript, with a timestamp toggle. Works on playlist pages, soft-navigation, and new 2026 "modern transcript view" panel.
 // @namespace    https://greasyfork.org/
 // @icon         https://www.google.com/s2/favicons?domain=youtube.com
 // ==/UserScript==
@@ -36,6 +36,53 @@
 
     // Initial run for the first page load
     handleNavigation();
+
+    // ---------------------------------------------------------------
+    // Panel / segment detection (supports BOTH old and new layouts)
+    // ---------------------------------------------------------------
+
+    // Old layout: ytd-transcript-segment-renderer inside
+    //   ytd-engagement-panel-section-list-renderer[target-id="engagement-panel-searchable-transcript"]
+    // New layout (2026 "modern transcript view"): transcript-segment-view-model inside
+    //   ytd-engagement-panel-section-list-renderer[target-id="PAmodern_transcript_view"]
+
+    const PANEL_SELECTORS = [
+        'ytd-engagement-panel-section-list-renderer[target-id="PAmodern_transcript_view"] #content',
+        'ytd-engagement-panel-section-list-renderer[target-id="engagement-panel-searchable-transcript"] #content'
+    ];
+
+    const SEGMENT_SELECTOR = 'transcript-segment-view-model, ytd-transcript-segment-renderer';
+
+    // Returns the panel content element that actually contains loaded segments, or null
+    function findLoadedTranscriptPanel() {
+        for (const selector of PANEL_SELECTORS) {
+            const panel = document.querySelector(selector);
+            if (panel && panel.querySelector(SEGMENT_SELECTOR)) {
+                return panel;
+            }
+        }
+        return null;
+    }
+
+    // Extracts { timestamp, text } from a segment element of either layout
+    function extractSegmentData(segment) {
+        if (segment.tagName.toLowerCase() === 'transcript-segment-view-model') {
+            // New layout
+            const timestampElement = segment.querySelector('.ytwTranscriptSegmentViewModelTimestamp');
+            const textElement = segment.querySelector('.ytAttributedStringHost, span[role="text"]');
+            return {
+                timestamp: timestampElement ? timestampElement.textContent.trim() : '',
+                text: textElement ? textElement.textContent.trim() : ''
+            };
+        }
+        // Old layout
+        const timestampElement = segment.querySelector('.segment-timestamp');
+        const textElement = segment.querySelector('.segment-text');
+        return {
+            timestamp: timestampElement ? timestampElement.textContent.trim() : '',
+            text: textElement ? textElement.textContent.trim() : ''
+        };
+    }
 
     function createTranscriptButton() {
         if (document.getElementById('show-transcript-button')) {
@@ -133,9 +180,25 @@
             playlistPanel.style.display = 'none';
         }
 
+        // Fast path: if a transcript panel is already open and loaded, copy immediately.
+        const alreadyLoadedPanel = findLoadedTranscriptPanel();
+        if (alreadyLoadedPanel) {
+            copyTranscriptText(alreadyLoadedPanel, cleanupUI);
+            return;
+        }
+
+        // The "Show transcript" button lives in the description's transcript section.
+        // Try it directly first; fall back to opening the "More actions" menu (old flow).
+        let transcriptButton = document.querySelector('[aria-label="Show transcript"]');
+        if (transcriptButton) {
+            transcriptButton.click();
+            waitForTranscriptPanel(cleanupUI);
+            return;
+        }
+
         const moreActionsButton = document.querySelector('button[aria-label="More actions"]');
         if (!moreActionsButton) {
-            console.error("Could not find 'More actions' button.");
+            console.error("Could not find 'Show transcript' or 'More actions' button.");
             updateButtonText("Error");
             copyButton.style.backgroundColor = "rgba(220, 53, 69, 0.8)";
             cleanupUI();
@@ -144,42 +207,46 @@
         moreActionsButton.click();
 
         const buttonIntervalId = setInterval(() => {
-            const transcriptButton = document.querySelector('[aria-label="Show transcript"]');
+            transcriptButton = document.querySelector('[aria-label="Show transcript"]');
             if (transcriptButton) {
                 transcriptButton.click();
                 clearInterval(buttonIntervalId);
                 clearTimeout(transcriptButtonTimeout);
-
-                const panelIntervalId = setInterval(() => {
-                    const transcriptPanel = document.querySelector('ytd-engagement-panel-section-list-renderer[target-id="engagement-panel-searchable-transcript"] #content');
-                    if (transcriptPanel && transcriptPanel.querySelector('ytd-transcript-segment-renderer')) {
-                        clearInterval(panelIntervalId);
-                        clearTimeout(transcriptPanelTimeout);
-                        copyTranscriptText(transcriptPanel, cleanupUI); // Pass cleanup to the next function
-                    }
-                }, 100);
-
-                transcriptPanelTimeout = setTimeout(() => {
-                    clearInterval(panelIntervalId);
-                    console.error("Transcript panel or segments not found after timeout.");
-                    if (copyButton) {
-                        updateButtonText("Transcript Not Found");
-                        copyButton.style.backgroundColor = "rgba(220, 53, 69, 0.8)";
-                    }
-                    cleanupUI();
-                }, 15000);
+                waitForTranscriptPanel(cleanupUI);
             }
         }, 250);
 
         transcriptButtonTimeout = setTimeout(() => {
             clearInterval(buttonIntervalId);
             if (copyButton) {
-                updateButtonText("Transcript Not Found")
+                updateButtonText("Transcript Not Found");
                 copyButton.style.backgroundColor = "rgba(220, 53, 69, 0.8)";
             }
             console.error("Transcript button not found after timeout.");
             cleanupUI();
         }, 10000);
+    }
+
+    // Polls for either the old or new transcript panel to finish loading segments
+    function waitForTranscriptPanel(cleanupUI) {
+        const panelIntervalId = setInterval(() => {
+            const transcriptPanel = findLoadedTranscriptPanel();
+            if (transcriptPanel) {
+                clearInterval(panelIntervalId);
+                clearTimeout(transcriptPanelTimeout);
+                copyTranscriptText(transcriptPanel, cleanupUI);
+            }
+        }, 100);
+
+        transcriptPanelTimeout = setTimeout(() => {
+            clearInterval(panelIntervalId);
+            console.error("Transcript panel or segments not found after timeout.");
+            if (copyButton) {
+                updateButtonText("Transcript Not Found");
+                copyButton.style.backgroundColor = "rgba(220, 53, 69, 0.8)";
+            }
+            cleanupUI();
+        }, 15000);
     }
 
     function copyTranscriptText(transcriptPanel, cleanupCallback) {
@@ -191,19 +258,24 @@
         }
 
         let transcriptText = "";
+        const segments = transcriptPanel.querySelectorAll(SEGMENT_SELECTOR);
 
-        if (includeTimestamps) {
-            transcriptPanel.querySelectorAll('ytd-transcript-segment-renderer').forEach(line => {
-                const timestampElement = line.querySelector('.segment-timestamp');
-                const textElement = line.querySelector('.segment-text');
-                if (timestampElement && textElement) {
-                    transcriptText += timestampElement.textContent.trim() + " " + textElement.textContent.trim() + "\n";
-                }
-            });
-        } else {
-            transcriptPanel.querySelectorAll('.segment-text').forEach(segment => {
-                transcriptText += segment.textContent.trim() + " ";
-            });
+        segments.forEach(segment => {
+            const { timestamp, text } = extractSegmentData(segment);
+            if (!text) return;
+            if (includeTimestamps) {
+                transcriptText += (timestamp ? timestamp + " " : "") + text + "\n";
+            } else {
+                transcriptText += text + " ";
+            }
+        });
+
+        if (!transcriptText.trim()) {
+            console.error("No transcript text extracted.");
+            updateButtonText("Transcript Not Found");
+            copyButton.style.backgroundColor = "rgba(220, 53, 69, 0.8)";
+            if (cleanupCallback) cleanupCallback();
+            return;
         }
 
         navigator.clipboard.writeText(transcriptText)
