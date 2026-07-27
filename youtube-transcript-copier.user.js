@@ -4,7 +4,7 @@
 // @grant        none
 // @version      1.3
 // @author       Amir Tehrani
-// @description  Adds a styled button to copy the YouTube video transcript, with a timestamp toggle. Works on playlist pages, soft-navigation, and new 2026 "modern transcript view" panel.
+// @description  Adds a styled button to copy the YouTube video transcript, with a timestamp toggle. Works on playlist pages, soft-navigation, and tabbed "In this video" / modern transcript view panel (ignores hidden dummy panels).
 // @namespace    https://greasyfork.org/
 // @icon         https://www.google.com/s2/favicons?domain=youtube.com
 // ==/UserScript==
@@ -38,50 +38,110 @@
     handleNavigation();
 
     // ---------------------------------------------------------------
-    // Panel / segment detection (supports BOTH old and new layouts)
+    // Panel / segment detection (supports old, modern, and tabbed layouts)
     // ---------------------------------------------------------------
+    //
+    // Layouts:
+    //  - Legacy: ytd-transcript-segment-renderer inside
+    //      ytd-engagement-panel-section-list-renderer[target-id="engagement-panel-searchable-transcript"]
+    //  - Modern/tabbed ("In this video"): transcript-segment-view-model inside
+    //      yt-section-list-renderer[data-target-id="PAmodern_transcript_view"]
+    //      (inner data-target-id — the OUTER panel may not carry target-id at all)
+    //
+    // TRAP: YouTube also renders a HIDDEN dummy panel with
+    //   target-id="PAmodern_transcript_view" + visibility="ENGAGEMENT_PANEL_VISIBILITY_HIDDEN"
+    //   containing only a spinner. Never match hidden panels.
 
-    // Old layout: ytd-transcript-segment-renderer inside
-    //   ytd-engagement-panel-section-list-renderer[target-id="engagement-panel-searchable-transcript"]
-    // New layout (2026 "modern transcript view"): transcript-segment-view-model inside
-    //   ytd-engagement-panel-section-list-renderer[target-id="PAmodern_transcript_view"]
+    const SEGMENT_SELECTOR = 'transcript-segment-view-model, .ytwTranscriptSegmentViewModelHost, ytd-transcript-segment-renderer';
+    const TIMESTAMP_RE = /^\d+:\d{2}(:\d{2})?$/;
 
-    const PANEL_SELECTORS = [
-        'ytd-engagement-panel-section-list-renderer[target-id="PAmodern_transcript_view"] #content',
-        'ytd-engagement-panel-section-list-renderer[target-id="engagement-panel-searchable-transcript"] #content'
-    ];
+    function log(...args) {
+        console.log('[YT Transcript Copier]', ...args);
+    }
 
-    const SEGMENT_SELECTOR = 'transcript-segment-view-model, ytd-transcript-segment-renderer';
+    function isPanelVisible(panel) {
+        if (panel.getAttribute('visibility') === 'ENGAGEMENT_PANEL_VISIBILITY_HIDDEN') return false;
+        if (panel.offsetParent === null) return false;
+        return true;
+    }
 
-    // Returns the panel content element that actually contains loaded segments, or null
+    // Returns the panel element that actually contains loaded, visible segments, or null
     function findLoadedTranscriptPanel() {
-        for (const selector of PANEL_SELECTORS) {
-            const panel = document.querySelector(selector);
-            if (panel && panel.querySelector(SEGMENT_SELECTOR)) {
-                return panel;
+        const panels = document.querySelectorAll('ytd-engagement-panel-section-list-renderer');
+        for (const panel of panels) {
+            if (!isPanelVisible(panel)) continue;
+
+            // A visible panel qualifies if it looks like the transcript panel:
+            //  (a) contains the inner modern transcript container, OR
+            //  (b) contains a "Search transcript" input, OR
+            //  (c) directly contains transcript segments (legacy)
+            const hasModernContainer = panel.querySelector('[data-target-id="PAmodern_transcript_view"], [data-target-id*="transcript"]');
+            const hasSearchBox = panel.querySelector('textarea[aria-label="Search transcript"], textarea[placeholder="Search transcript"], input[placeholder="Search transcript"]');
+            const segments = panel.querySelectorAll(SEGMENT_SELECTOR);
+
+            if ((hasModernContainer || hasSearchBox || segments.length > 0)) {
+                if (segments.length > 0) {
+                    log('Panel matched (visible, segments loaded):', panel.getAttribute('target-id') || '(no target-id)', '| segments:', segments.length);
+                    return panel;
+                }
+                // Transcript-looking panel found but segments not rendered yet — keep polling
+                log('Transcript panel visible but segments not loaded yet:', panel.getAttribute('target-id') || '(no target-id)');
             }
         }
         return null;
     }
 
-    // Extracts { timestamp, text } from a segment element of either layout
+    // Extracts { timestamp, text } from a segment element of any layout
     function extractSegmentData(segment) {
-        if (segment.tagName.toLowerCase() === 'transcript-segment-view-model') {
-            // New layout
+        const tag = segment.tagName.toLowerCase();
+        if (tag === 'transcript-segment-view-model' || segment.classList.contains('ytwTranscriptSegmentViewModelHost')) {
+            // Modern layout
             const timestampElement = segment.querySelector('.ytwTranscriptSegmentViewModelTimestamp');
-            const textElement = segment.querySelector('.ytAttributedStringHost, span[role="text"]');
+            const textElement = segment.querySelector('.ytAttributedStringHost[role="text"], span[role="text"], .ytAttributedStringHost');
+            let timestamp = timestampElement ? timestampElement.textContent.trim() : '';
+            // Fallback: scan children for something that looks like a timecode
+            if (!timestamp) {
+                for (const child of segment.querySelectorAll('div, span')) {
+                    const t = child.textContent.trim();
+                    if (TIMESTAMP_RE.test(t)) { timestamp = t; break; }
+                }
+            }
             return {
-                timestamp: timestampElement ? timestampElement.textContent.trim() : '',
+                timestamp: timestamp,
                 text: textElement ? textElement.textContent.trim() : ''
             };
         }
-        // Old layout
+        // Legacy layout
         const timestampElement = segment.querySelector('.segment-timestamp');
         const textElement = segment.querySelector('.segment-text');
         return {
             timestamp: timestampElement ? timestampElement.textContent.trim() : '',
             text: textElement ? textElement.textContent.trim() : ''
         };
+    }
+
+    // Last-resort extraction: walk the panel pairing timecode nodes with adjacent text
+    function fallbackExtract(panel) {
+        log('Running fallback node-walk extraction...');
+        const results = [];
+        const walker = document.createTreeWalker(panel, NodeFilter.SHOW_ELEMENT);
+        let currentTimestamp = '';
+        let node;
+        while ((node = walker.nextNode())) {
+            // Only inspect leaf-ish elements to avoid duplicated concatenated text
+            if (node.children.length > 0) continue;
+            const t = node.textContent.trim();
+            if (!t) continue;
+            if (TIMESTAMP_RE.test(t)) {
+                currentTimestamp = t;
+            } else if (node.matches('span[role="text"], .ytAttributedStringHost, .segment-text') ||
+                       (currentTimestamp && t.length > 1 && !node.closest('#header, form, button'))) {
+                results.push({ timestamp: currentTimestamp, text: t });
+                currentTimestamp = '';
+            }
+        }
+        log('Fallback extraction found', results.length, 'entries');
+        return results;
     }
 
     function createTranscriptButton() {
@@ -141,7 +201,7 @@
     }
 
     function insertButton() {
-        // Robust list of potential targets to handle different YouTube layouts (e.g., playlist vs. standard).
+        // List of potential targets to handle different YouTube layouts (e.g., playlist vs. standard).
         const potentialTargets = [
             '#owner', // Reliable on both layouts, next to channel info
             '#above-the-fold #actions-inner', // Reliable on both layouts, inside like/share container
@@ -152,7 +212,7 @@
 
         for (const targetSelector of potentialTargets) {
             const targetElement = document.querySelector(targetSelector);
-            // Check if the element exists AND is visible before inserting the button.
+            // Check if  element exists AND is visible before inserting the button.
             if (targetElement && targetElement.offsetParent !== null) {
                 targetElement.parentNode.insertBefore(copyButton, targetElement.nextSibling);
                 injectStyles();
@@ -167,20 +227,20 @@
 
         const playlistPanel = document.querySelector('ytd-playlist-panel-renderer#playlist');
 
-        // Function will be called to restore the UI to its original state
+        // Function called to restore the UI to  original state
         function cleanupUI() {
             if (playlistPanel) {
                 playlistPanel.style.display = ''; // Restore playlist visibility
             }
         }
 
-        // On playlist pages, the playlist panel conflicts with the transcript panel
-        // Temporarily hide it to allow the transcript to load
+        // On playlist pages,  playlist panel conflicts with  transcript panel
+        // Temporarily hide it to allow  transcript to load
         if (playlistPanel) {
             playlistPanel.style.display = 'none';
         }
 
-        // Fast path: if a transcript panel is already open and loaded, copy immediately.
+        // Fast path: if transcript panel is open and loaded, copy immediately.
         const alreadyLoadedPanel = findLoadedTranscriptPanel();
         if (alreadyLoadedPanel) {
             copyTranscriptText(alreadyLoadedPanel, cleanupUI);
@@ -188,7 +248,7 @@
         }
 
         // The "Show transcript" button lives in the description's transcript section.
-        // Try it directly first; fall back to opening the "More actions" menu (old flow).
+        // Try directly first; fall back to opening the "More actions" menu (old flow).
         let transcriptButton = document.querySelector('[aria-label="Show transcript"]');
         if (transcriptButton) {
             transcriptButton.click();
@@ -257,18 +317,29 @@
             return;
         }
 
-        let transcriptText = "";
         const segments = transcriptPanel.querySelectorAll(SEGMENT_SELECTOR);
+        log('copyTranscriptText: found', segments.length, 'segment elements');
 
+        let entries = [];
         segments.forEach(segment => {
-            const { timestamp, text } = extractSegmentData(segment);
-            if (!text) return;
+            const data = extractSegmentData(segment);
+            if (data.text) entries.push(data);
+        });
+
+        // If class-based extraction produced nothing, fall back to node walking
+        if (entries.length === 0) {
+            entries = fallbackExtract(transcriptPanel);
+        }
+
+        let transcriptText = "";
+        entries.forEach(({ timestamp, text }) => {
             if (includeTimestamps) {
                 transcriptText += (timestamp ? timestamp + " " : "") + text + "\n";
             } else {
                 transcriptText += text + " ";
             }
         });
+        log('Extracted', entries.length, 'entries,', transcriptText.length, 'chars');
 
         if (!transcriptText.trim()) {
             console.error("No transcript text extracted.");
